@@ -2,15 +2,15 @@ name: Build and Push Docker Image to Docker Hub
 
 on:
   push:
-    branches: ["main"]
-  pull_request:
-    branches: ["main"]
+#    branches: ["main"]
+#  pull_request:
+#    branches: ["main"]
 
 env:
   # Use docker.io for Docker Hub if empty
   REGISTRY: docker.io
   # github.repository as <account>/<repo>
-  IMAGE_NAME: ${{ vars.IMAGE_NAME || "thisisarpanghosh/fitbit-fetch-data" }}
+  IMAGE_NAME: ${{ vars.DOCKER_IMAGE_NAME || 'thisisarpanghosh/fitbit-fetch-data' }}
 
 jobs:
   build:
