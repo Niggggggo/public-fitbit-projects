@@ -10,7 +10,7 @@ env:
   # Use docker.io for Docker Hub if empty
   REGISTRY: docker.io
   # github.repository as <account>/<repo>
-  IMAGE_NAME: ${{ vars.DOCKER_IMAGE_NAME || 'thisisarpanghosh/fitbit-fetch-data' }}
+  IMAGE_NAME: ${{ vars.IMAGE_NAME || 'thisisarpanghosh/fitbit-fetch-data' }}
 
 jobs:
   build:
@@ -48,4 +48,4 @@ jobs:
         with:
           context: "{{defaultContext}}"
           push: true
-          tags: thisisarpanghosh/fitbit-fetch-data:latest
+          tags: ${{ vars.IMAGE_NAME }}:latest
