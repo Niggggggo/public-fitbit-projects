@@ -9,6 +9,10 @@ from influxdb.exceptions import InfluxDBClientError
 from influxdb_client import InfluxDBClient as InfluxDBClient2
 from influxdb_client.client.exceptions import InfluxDBError
 from influxdb_client.client.write_api import SYNCHRONOUS
+from pyrate_limiter import SQLiteBucket
+from requests_ratelimiter import LimiterSession
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
 
 # %% [markdown]
 # ## Variables
@@ -36,12 +40,14 @@ client_secret = os.environ.get("CLIENT_SECRET") or "your_application_client_secr
 DEVICENAME = os.environ.get("DEVICENAME") or "Your_Device_Name" # e.g. "Charge5"
 ACCESS_TOKEN = "" # Empty Global variable initialization, will be replaced with a functional access code later using the refresh code
 AUTO_DATE_RANGE = True # Automatically selects date range from todays date and update_date_range variable
-auto_update_date_range = 1 # Days to go back from today for AUTO_DATE_RANGE *** DO NOT go above 2 - otherwise may break rate limit ***
+auto_update_date_range = 5 # Days to go back from today for AUTO_DATE_RANGE *** DO NOT go above 2 - otherwise may break rate limit ***
 LOCAL_TIMEZONE = os.environ.get("LOCAL_TIMEZONE") or "Automatic" # set to "Automatic" for Automatic setup from User profile (if not mentioned here specifically).
 SCHEDULE_AUTO_UPDATE = True if AUTO_DATE_RANGE else False # Scheduling updates of data when script runs
 SERVER_ERROR_MAX_RETRY = 3
 EXPIRED_TOKEN_MAX_RETRY = 5
 SKIP_REQUEST_ON_SERVER_ERROR = True
+
+session = LimiterSession(per_second=5, bucket_class=SQLiteBucket)
 
 # %% [markdown]
 # ## Logging setup
@@ -62,12 +68,56 @@ logging.basicConfig(
 # %% [markdown]
 # ## Setting up base API Caller function
 
+# %% [markdown]
+# ## Rate Limiter classes
+
+class DynamicRateLimiter:
+    def __init__(self, default_rate=1, default_per=1):
+        self.rate = default_rate
+        self.per = default_per
+        self.last_request_time = 0
+
+    def wait(self):
+        now = time.time()
+        elapsed = now - self.last_request_time
+        wait_time = self.per / self.rate - elapsed
+        if wait_time > 0:
+            time.sleep(wait_time)
+        self.last_request_time = time.time()
+
+    def update_limit(self, headers):
+        # Update rate limit based on response headers
+        if 'fitbit-rate-limit-limit' in headers and 'fitbit-rate-limit-reset' in headers:
+            self.rate = int(headers['fitbit-rate-limit-limit'])
+            self.per = int(headers['fitbit-rate-limit-reset'])
+
+
+class RateLimitedSession(requests.Session):
+    def __init__(self, rate_limiter):
+        super().__init__()
+        self.rate_limiter = rate_limiter
+
+        # Configure retry strategy
+        retries = Retry(total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+        self.mount('https://', HTTPAdapter(max_retries=retries))
+        self.mount('http://', HTTPAdapter(max_retries=retries))
+
+    def request(self, method, url, *args, **kwargs):
+        self.rate_limiter.wait()
+        response = super().request(method, url, *args, **kwargs)
+        self.rate_limiter.update_limit(response.headers)
+        return response
+
+rate_limiter = DynamicRateLimiter(default_rate=20, default_per=1)  # Default to 20 requests per second
+session = RateLimitedSession(rate_limiter)
+
 # %%
 # Generic Request caller for all 
 def request_data_from_fitbit(url, headers={}, params={}, data={}, request_type="get"):
     global ACCESS_TOKEN
     retry_attempts = 0
     logging.debug("Requesting data from fitbit via Url : " + url)
+
     while True: # Unlimited Retry attempts
         if request_type == "get":
             headers = {
@@ -77,9 +127,9 @@ def request_data_from_fitbit(url, headers={}, params={}, data={}, request_type="
             }
         try:        
             if request_type == "get":
-                response = requests.get(url, headers=headers, params=params, data=data)
+                response = session.get(url, headers=headers, params=params, data=data)
             elif request_type == "post":
-                response = requests.post(url, headers=headers, params=params, data=data)
+                response = session.post(url, headers=headers, params=params, data=data)
             else:
                 raise Exception("Invalid request type " + str(request_type))
         
@@ -631,15 +681,15 @@ else:
 # Ongoing continuous update of data
 if SCHEDULE_AUTO_UPDATE:
     
-    schedule.every(1).hours.do(lambda : Get_New_Access_Token(client_id,client_secret)) # Auto-refresh tokens every 1 hour
-    schedule.every(3).minutes.do( lambda : get_intraday_data_limit_1d(end_date_str, [('heart','HeartRate_Intraday','1sec'),('steps','Steps_Intraday','1min')] )) # Auto-refresh detailed HR and steps
-    schedule.every(1).hours.do( lambda : get_intraday_data_limit_1d((datetime.strptime(end_date_str, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d"), [('heart','HeartRate_Intraday','1sec'),('steps','Steps_Intraday','1min')] )) # Refilling any missing data on previous day end of night due to fitbit sync delay ( see issue #10 )
-    schedule.every(20).minutes.do(get_battery_level) # Auto-refresh battery level
-    schedule.every(3).hours.do(lambda : get_daily_data_limit_30d(start_date_str, end_date_str))
-    schedule.every(4).hours.do(lambda : get_daily_data_limit_100d(start_date_str, end_date_str))
-    schedule.every(6).hours.do( lambda : get_daily_data_limit_365d(start_date_str, end_date_str))
-    schedule.every(6).hours.do(lambda : get_daily_data_limit_none(start_date_str, end_date_str))
-    schedule.every(1).hours.do( lambda : fetch_latest_activities(end_date_str))
+    # schedule.every(1).hours.do(lambda : Get_New_Access_Token(client_id,client_secret)) # Auto-refresh tokens every 1 hour
+    schedule.every(1).minutes.do( lambda : get_intraday_data_limit_1d(end_date_str, [('heart','HeartRate_Intraday','1sec'),('steps','Steps_Intraday','1min')] )) # Auto-refresh detailed HR and steps
+    # schedule.every(1).hours.do( lambda : get_intraday_data_limit_1d((datetime.strptime(end_date_str, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d"), [('heart','HeartRate_Intraday','1sec'),('steps','Steps_Intraday','1min')] )) # Refilling any missing data on previous day end of night due to fitbit sync delay ( see issue #10 )
+    # schedule.every(20).minutes.do(get_battery_level) # Auto-refresh battery level
+    # schedule.every(3).hours.do(lambda : get_daily_data_limit_30d(start_date_str, end_date_str))
+    # schedule.every(4).hours.do(lambda : get_daily_data_limit_100d(start_date_str, end_date_str))
+    # schedule.every(6).hours.do( lambda : get_daily_data_limit_365d(start_date_str, end_date_str))
+    # schedule.every(6).hours.do(lambda : get_daily_data_limit_none(start_date_str, end_date_str))
+    # schedule.every(1).hours.do( lambda : fetch_latest_activities(end_date_str))
 
     while True:
         schedule.run_pending()
